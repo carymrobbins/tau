@@ -33,8 +33,18 @@ def printerr(*args, **kwargs):
 def parse_args():
     p = argparse.ArgumentParser(description='Tau time tracker')
     p.add_argument('command', choices=['track', 'view'], help='Command to run')
-    p.add_argument('--count', type=int, default=100,
-                   help='Rows returned for view command; default to 100')
+    p.add_argument(
+        '--count', type=int, default=100,
+        help='Rows returned for view command; defaults to 100'
+    )
+    p.add_argument(
+        '--pager', default='less',
+        help="Pager for view command; defaults to 'less'"
+    )
+    p.add_argument(
+        '--nopager', action='store_const', const=True, default=False,
+        help='Disable pager for view command'
+    )
     args = p.parse_args()
     if args.count < 0:
         printerr(f'Invalid --count {args.count}; must be positive')
@@ -107,6 +117,19 @@ def fetch_latest_entry():
     )
 
 def do_view(args):
+    table = draw_table(args)
+    if (args.nopager):
+        print(table)
+    else:
+        try:
+            p = Popen(args.pager, stdin=PIPE)
+            p.stdin.write(table.encode('utf8'))
+            p.stdin.close()
+            p.wait()
+        except KeyboardInterrupt:
+            pass
+
+def draw_table(args):
     c = DB.execute(f"""
         select id, title, start, stop
         from entries
@@ -118,7 +141,7 @@ def do_view(args):
         ['ID', 'Title', 'Start', 'Stop'],
         *((r[0], r[1], timestamp_to_local(r[2]), timestamp_to_local(r[3])) for r in c)
     ])
-    print(table.draw())
+    return table.draw()
 
 def timestamp_to_local(timestamp):
     if not timestamp:
