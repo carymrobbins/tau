@@ -5,11 +5,13 @@ from datetime import datetime
 from dateutil.tz import tzlocal
 import os
 import pytz
+from setproctitle import setproctitle
 import sqlite3
 from subprocess import Popen, PIPE
 import sys
 import texttable
 
+setproctitle('tau')
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 DB = sqlite3.connect(os.path.join(SCRIPT_DIR, 'tau.db'))
 
