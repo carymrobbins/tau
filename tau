@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+
+import argparse
+from datetime import datetime
+from dateutil.tz import tzlocal
+import os
+import pytz
+import sqlite3
+from subprocess import Popen, PIPE
+import sys
+import texttable
+
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+DB = sqlite3.connect(os.path.join(SCRIPT_DIR, 'tau.db'))
+
+def main():
+    args = parse_args()
+    if args.command == 'track':
+        do_track()
+        commit_and_close()
+        return
+    if args.command == 'view':
+        do_view(args)
+        return
+
+def commit_and_close():
+    DB.commit()
+    DB.close()
+
+def printerr(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+
+def parse_args():
+    p = argparse.ArgumentParser(description='Tau time tracker')
+    p.add_argument('command', choices=['track', 'view'], help='Command to run')
+    p.add_argument('--count', type=int, default=100,
+                   help='Rows returned for view command; default to 100')
+    args = p.parse_args()
+    if args.count < 0:
+        printerr(f'Invalid --count {args.count}; must be positive')
+        p.print_help(file = sys.stderr)
+        exit(1)
+    return args
+
+def get_title():
+    p = Popen(["xdotool", "getwindowfocus", "getwindowname"], stdout=PIPE, stderr=PIPE)
+    p.wait()
+    out = p.stdout.read()
+    if p.returncode != 0 or not out:
+        if p.returncode != 0:
+            printerr(f'xdotool fail with nonzero exit code {p.returncode}')
+        elif not out:
+            printerr(f'xdotool failed to return output')
+        if out:
+            printerr(f'stdout was: {out}')
+        err = p.stderr.read()
+        if err:
+            printerr(f'stderr was: {err}')
+        exit(1)
+    out = out.decode('utf8').strip()
+    print(f'Active window title is: {out}')
+    return out
+
+def init_db():
+    DB.execute("""
+        create table if not exists entries(
+            id integer primary key autoincrement,
+            title text,
+            start integer,
+            stop integer default null
+        )
+    """)
+
+class Entry:
+
+    @classmethod
+    def from_row(cls, r):
+        if r is None:
+            return None
+        if len(r) != 4:
+            raise RuntimeError(f'Expected 4 columns but got {len(r)}')
+        return Entry(*r)
+
+    def __init__(self, id, title, start, stop):
+        self.id = id
+        self.title = title
+        self.start = start
+        self.stop = stop
+
+    def __iter__(self):
+        yield self.id
+        yield self.title
+        yield self.start
+        yield self.stop
+
+    def __repr__(self):
+        return 'Entry(' + ', '.join(map(repr, self)) + ')'
+
+def fetch_latest_entry():
+    return Entry.from_row(
+        DB.execute("""
+            select id, title, start, stop
+            from entries
+            order by id desc
+            limit 1
+        """).fetchone()
+    )
+
+def do_view(args):
+    c = DB.execute(f"""
+        select id, title, start, stop
+        from entries
+        order by id desc
+        limit {args.count}
+    """)
+    table = texttable.Texttable()
+    table.add_rows([
+        ['ID', 'Title', 'Start', 'Stop'],
+        *((r[0], r[1], timestamp_to_local(r[2]), timestamp_to_local(r[3])) for r in c)
+    ])
+    print(table.draw())
+
+def timestamp_to_local(timestamp):
+    if not timestamp:
+        return ''
+    # time_format = '%Y-%m-%d %H:%M %P'
+    time_format = '%B %-d, %Y | %H:%M %P'
+    return (
+        pytz.utc.localize(datetime.fromtimestamp(timestamp))
+            .astimezone(tzlocal())
+            .strftime(time_format)
+    )
+
+def do_track():
+    init_db()
+    title = get_title()
+    latest = fetch_latest_entry()
+    if latest:
+        # If the latest.title matches, check to see if it's within a time window
+        # to infer that we're *still* working on it. If we are, we will bail out
+        # with return and won't have to add a new entry.
+        if latest.title == title:
+            if within_static_window(latest.stop) or within_static_window(latest.start):
+                update_entry_stop(latest, utcnow_timestamp())
+                return
+        # If the title doesn't match, check to see if the latest.stop is None.
+        # If it's None, let's just assume we worked on the task for 1 minute.
+        # We need to proceed and add_entry() after this since we haven't accounted
+        # for the new title.
+        if not latest.stop:
+            update_entry_stop(latest, latest.start + 60)
+
+    add_entry(title, utcnow_timestamp())
+
+def update_entry_stop(entry, stop):
+    print(f'Updating stop to {stop} for entry {entry}')
+    DB.execute("update entries set stop = ? where id = ?", (stop, entry.id))
+
+def add_entry(title, start):
+    print(f'Adding entry {repr(title)} at start {start}')
+    DB.execute("insert into entries (title, start) values (?, ?)", (title, start))
+
+def utcnow_timestamp():
+    return int(datetime.utcnow().timestamp())
+
+# If our activity didnt change within a 120 second window,
+# then assume we've been working on it since. This should work since
+# this script runs every minute.
+def within_static_window(timestamp):
+    if not timestamp:
+        return False
+    return utcnow_timestamp() - timestamp < 120
+
+if __name__ == '__main__':
+    main()

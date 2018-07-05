@@ -1,0 +1,8 @@
+[Unit]
+Description=Run Tau Time Tracker every minute
+
+[Timer]
+OnCalendar=minutely
+
+[Install]
+WantedBy=wm.target
