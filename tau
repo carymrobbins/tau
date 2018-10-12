@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 
 import argparse
-from datetime import datetime
+from collections import namedtuple
+from datetime import datetime, timedelta, date
+import dateutil.parser
 from dateutil.tz import tzlocal
 import os
+from itertools import takewhile, dropwhile
+from inspect import signature
 import pytz
+import re
+import shutil
 from setproctitle import setproctitle
 import sqlite3
 from subprocess import Popen, PIPE
@@ -15,52 +21,128 @@ setproctitle('tau')
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 DB = sqlite3.connect(os.path.join(SCRIPT_DIR, 'tau.db'))
 
+
 def main():
     args = parse_args()
-    if args.command == 'track':
-        do_track()
-        commit_and_close()
+    dispatch(args)
+
+
+def dispatch(args):
+    f = args.func
+    argc = len(signature(f).parameters)
+    if argc == 0:
+        f()
         return
-    if args.command == 'view':
-        do_view(args)
+    if argc == 1:
+        f(args)
         return
+    raise RuntimeError(f'Unexpected function signature for {f}: {signature(f)}')
+
 
 def commit_and_close():
     DB.commit()
     DB.close()
 
+
 def printerr(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
 
-def parse_args():
+
+def get_argument_parser():
     p = argparse.ArgumentParser(description='Tau time tracker')
-    p.add_argument('command', choices=['track', 'view'], help='Command to run')
-    p.add_argument(
-        '--count', type=int, default=100,
+
+    command_p = p.add_subparsers(
+        dest='command', parser_class=CommandArgumentParser)
+
+    command_p.add_parser('track', func=do_track)
+
+    view_p = command_p.add_parser('view', func=do_view)
+    view_p.add_argument(
+        '--count', nargs='?', type=int,
         help='Rows returned for view command; defaults to 100'
     )
-    p.add_argument(
+    view_p.add_argument(
+        '--reverse', action='store_const', const=True, default=False,
+        help='Reverse the output, sort earliest to latest'
+    )
+    view_p.add_argument(
+        '--start', nargs='?', type=parse_local_datetime_arg,
+        help='Select a start time for filtering entries'
+    )
+    view_p.add_argument(
+        '--stop', nargs='?', type=parse_local_datetime_arg,
+        help='Select a stop time for filtering entries'
+    )
+    view_p.add_argument(
         '--pager', default='less',
         help="Pager for view command; defaults to 'less'"
     )
-    p.add_argument(
+    view_p.add_argument(
         '--nopager', action='store_const', const=True, default=False,
         help='Disable pager for view command'
     )
+
+    timecard_p = command_p.add_parser('timecard', func=do_timecard)
+    timecard_p.add_argument('date', nargs='?', type=timecard_date_str)
+
+    active_p = command_p.add_parser('active', func=do_active)
+    active_p.add_argument(
+        '--minutes', action='store_const', const=True, default=False,
+        help='Output only minutes for active command'
+    )
+
+    return p
+
+
+class CommandArgumentParser(argparse.ArgumentParser):
+    def __init__(self, *args, **kwargs):
+        self.func = kwargs.pop('func')
+        super(CommandArgumentParser, self).__init__(*args, **kwargs)
+
+    def parse_known_args(self, *args, **kwargs):
+        namespace, args = super(CommandArgumentParser, self).parse_known_args(
+            *args, **kwargs)
+        namespace.func = self.func
+        return namespace, args
+
+
+def parse_local_datetime_arg(s):
+    return dateutil.parser.parse(s)
+
+
+def timecard_date_str(s):
+    try:
+        n = int(s)
+    except ValueError:
+        pass
+    else:
+        if n <= 0:
+            return str(date.today() + timedelta(days=n))
+        else:
+            raise ValueError(f'Relative timecard date must be <= 0 days; got {n}')
+    try:
+        return str(dateutil.parser.parse(s).date())
+    except ValueError:
+        raise ValueError(f'Invalid timecard date: {s}')
+
+
+def parse_args():
+    p = get_argument_parser()
     args = p.parse_args()
-    if args.count < 0:
-        printerr(f'Invalid --count {args.count}; must be positive')
-        p.print_help(file = sys.stderr)
+    if not args.command:
+        p.print_help()
         exit(1)
     return args
 
+
 def get_title():
-    p = Popen(["xdotool", "getwindowfocus", "getwindowname"], stdout=PIPE, stderr=PIPE)
+    p = Popen(["xdotool", "getwindowfocus", "getwindowname"], stdout=PIPE,
+              stderr=PIPE)
     p.wait()
     out = p.stdout.read()
     if p.returncode != 0 or not out:
         if p.returncode != 0:
-            printerr(f'xdotool fail with nonzero exit code {p.returncode}')
+            printerr(f'xdotool failed with nonzero exit code {p.returncode}')
         elif not out:
             printerr(f'xdotool failed to return output')
         if out:
@@ -70,12 +152,31 @@ def get_title():
             printerr(f'stderr was: {err}')
         exit(1)
     out = out.decode('utf8').strip()
-    print(f'Active window title is: {out}')
     return out
+
+
+def get_idle_time():
+    p = Popen(["xssstate", "-i"], stdout=PIPE)
+    p.wait()
+    out = p.stdout.read()
+    if p.returncode != 0:
+        printerr(f'xssstate failed with nonzero exit code {p.returncode}')
+        exit(1)
+    return int(out.decode('utf8').strip()) / 1000
+
+
+IDLE_THRESHOLD = 300  # 5 minutes
+
+
+# We're considering the user as inactive if they have been idle for 5 minutes
+def is_inactive(title):
+    return title in INACTIVE_APPLICATIONS or get_idle_time() > IDLE_THRESHOLD
+
 
 def init_db():
     DB.execute("""
-        create table if not exists entries(
+        create table if not exists
+        entries(
             id integer primary key autoincrement,
             title text,
             start integer,
@@ -83,8 +184,8 @@ def init_db():
         )
     """)
 
-class Entry:
 
+class Entry:
     @classmethod
     def from_row(cls, r):
         if r is None:
@@ -99,14 +200,18 @@ class Entry:
         self.start = start
         self.stop = stop
 
-    def __iter__(self):
-        yield self.id
-        yield self.title
-        yield self.start
-        yield self.stop
-
     def __repr__(self):
-        return 'Entry(' + ', '.join(map(repr, self)) + ')'
+        return (
+                'Entry(' +
+                ', '.join((
+                    repr(self.id),
+                    repr(self.title),
+                    repr(timestamp_to_local(self.start)),
+                    repr(timestamp_to_local(self.stop))
+                )) +
+                ')'
+        )
+
 
 def fetch_latest_entry():
     return Entry.from_row(
@@ -118,9 +223,52 @@ def fetch_latest_entry():
         """).fetchone()
     )
 
+
+def do_active(args):
+    if is_inactive(get_title()):
+        if args.minutes:
+            print(0)
+        else:
+            print('Inactive')
+        return
+    # Consider the user as active as long as they have not had gaps longer than
+    # 120 seconds in between time entries.
+    active_window = 120
+    now = utcnow_timestamp()
+    ref = now
+    last = Entry.from_row(
+        DB.execute("""
+            select id, title, start, stop
+            from entries
+            order by id desc
+            limit 1
+        """).fetchone()
+    )
+    # The `last.stop is None` check is just for the first record.
+    while last.stop is None or ref - last.stop < active_window:
+        ref = last.start
+        last = Entry.from_row(
+            DB.execute("""
+                select id, title, start, stop
+                from entries
+                where id < ?
+                order by id desc
+                limit 1
+            """, [last.id]).fetchone()
+        )
+    td = timedelta(seconds=now - ref)
+    if args.minutes:
+        print(int(td.total_seconds() / 60))
+    else:
+        print(td)
+
+
 def do_view(args):
+    if args.count and args.count <= 0:
+        printerr(f'Invalid --count {args.count}; must be > 0')
+        exit(1)
     table = draw_table(args)
-    if (args.nopager):
+    if args.nopager:
         print(table)
     else:
         try:
@@ -131,41 +279,231 @@ def do_view(args):
         except KeyboardInterrupt:
             pass
 
+
+def do_timecard(args):
+    if args.date is None:
+        args.date = str(date.today())
+    c = DB.cursor()
+    c.execute("select id, title, start, stop from entries order by id desc")
+    it = map(Entry.from_row, c)
+    list(takewhile(
+        lambda x: x and timestamp_to_local_date_string(x.start) > args.date,
+        it))
+    entries = list(takewhile(
+        lambda x: x and timestamp_to_local_date_string(x.start) == args.date,
+        it))
+    c.close()
+    by_title = {}
+    for entry in entries:
+        group = get_title_group(entry.title)
+        title_sum = by_title.get(group)
+        if not title_sum:
+            title_sum = 0
+        if entry.start and entry.stop:
+            title_sum += entry.stop - entry.start
+        by_title[group] = title_sum
+    punches = []
+    last_punch_title_groups = None
+    for entry in reversed(entries):
+        if not entry.stop:
+            continue
+        if not punches:
+            punch = TimecardPunch(entry)
+            punches.append(punch)
+            last_punch_title_groups = {punch.title_group: punch.duration()}
+        else:
+            last_punch = punches[-1]
+            if abs(last_punch.stop - entry.start) < IDLE_THRESHOLD:
+                # Update last_punch's stop time.
+                last_punch.stop = entry.stop
+                # Update last_punch's title_group to be the mode.
+                partial_punch = TimecardPunch(entry)
+                title_group_dur = last_punch_title_groups.get(
+                    partial_punch.title_group, 0)
+                last_punch_title_groups[partial_punch.title_group] = \
+                    title_group_dur + partial_punch.duration()
+                last_punch.title_group, last_punch.group_dur = max(
+                    last_punch_title_groups.items(),
+                    key=lambda kv: kv[1])
+            else:
+                punch = TimecardPunch(entry)
+                punches.append(punch)
+                last_punch_title_groups = {punch.title_group: punch.duration()}
+    print('/==========================\\')
+    print('|  Timecard: ' + args.date + '    |')
+    print('\\==========================/')
+    print()
+    print('Punches')
+    print('------------------')
+    print('Acc     | In       - Out      | Dur     | Group Mode')
+    acc = timedelta()
+    for punch in punches:
+        seconds = punch.duration()
+        if seconds > IDLE_THRESHOLD:
+            dur = timedelta(seconds=seconds)
+            acc += dur
+            print('{} | {} - {} | {} | [{}|{}%] {} '.format(
+                acc,
+                timestamp_to_local(punch.start, '%I:%M %p').lower(),
+                timestamp_to_local(punch.stop, '%I:%M %p').lower(),
+                dur,
+                timedelta(seconds=punch.group_dur),
+                round(float(punch.group_dur) / dur.seconds * 100),
+                punch.title_group,
+            ))
+    print()
+    print('Timecard by title group')
+    print('--------------------------')
+    by_title_sorted = sorted(
+        ((k, timedelta(seconds=v)) for k, v in by_title.items()
+         if v >= TIMECARD_GROUP_THRESHOLD),
+        key=lambda t: -t[1])
+    for k, v in by_title_sorted:
+        print('{}: {}'.format(k, v))
+
+
+TIMECARD_GROUP_THRESHOLD = 600  # 10 minutes
+
+
+class TimecardPunch:
+    def __init__(self, entry):
+        self.start = entry.start
+        self.stop = entry.stop
+        self.title_group = get_title_group(entry.title)
+        self.group_dur = self.duration()
+
+    def duration(self):
+        return self.stop - self.start
+
+
+class TitleGroupHandler:
+    def __init__(self, name, pattern, handler=None):
+        self.name = name
+        self.pattern = pattern
+        if isinstance(handler, str):
+            self.handler = lambda _: handler
+        elif handler is None:
+            self.handler = lambda _: name
+        elif callable(handler):
+            self.handler = handler
+        else:
+            raise ValueError(
+                'Invalid handler {}; expected callable, str or None; got {!r}'
+                    .format(name, handler))
+
+    def __call__(self, title):
+        m = self.pattern.match(title)
+        if not m:
+            return None
+        return self.handler(m)
+
+
+TITLE_GROUP_HANDLERS = [
+    TitleGroupHandler(
+        'IntelliJ', re.compile(r'^([^\[]+\[[^\]]+\]).* - IntelliJ IDEA$'),
+        lambda m: 'IntelliJ: {}'.format(m.group(1))),
+    TitleGroupHandler(
+        'Vim', re.compile(r'^(v|vim) ([^:]+):(.*)$'),
+        lambda m: 'Vim: {}'.format(m.group(3))),
+    TitleGroupHandler(
+        'Terminal', re.compile(r'^zsh:(.*)$'),
+        lambda m: 'Terminal: {}'.format(m.group(1))),
+    TitleGroupHandler('YouTube', re.compile(r'^.*\bYouTube\b.*$')),
+    TitleGroupHandler('Pull Request', re.compile(r'^.* Pull Request .*$')),
+    TitleGroupHandler('Chrome', re.compile(r'^.* - Google Chrome$')),
+]
+
+
+def get_title_group(title):
+    for handler in TITLE_GROUP_HANDLERS:
+        res = handler(title)
+        if res is not None:
+            return res
+    return title
+
+
 def draw_table(args):
-    c = DB.execute(f"""
-        select id, title, start, stop
-        from entries
-        order by id desc
-        limit {args.count}
-    """)
-    table = texttable.Texttable()
+    wheres = []
+    q_args = []
+    if args.start:
+        wheres.append('start >= ?')
+        q_args.append(args.start.timestamp())
+    if args.stop:
+        wheres.append('stop <= ?')
+        q_args.append(args.stop.timestamp())
+    if args.reverse:
+        order = 'order by id asc'
+    else:
+        order = 'order by id desc'
+    if args.start and args.stop and not args.count:
+        limit = ''
+    else:
+        args.count = args.count or 100
+        limit = f'limit {args.count}'
+    if wheres:
+        where = 'where ' + ' and '.join(f'({w})' for w in wheres)
+    else:
+        where = ''
+    sql_args = [
+        f"""
+            select id, title, start, stop
+            from entries
+            {where}
+            {order}
+            {limit}
+        """,
+        q_args
+    ]
+    print(*sql_args)
+    c = DB.execute(*sql_args)
+    # Using 0 as the default since that signals to texttable to use an unlimited width.
+    (cols, _) = shutil.get_terminal_size((0, 0))
+    table = texttable.Texttable(max_width=cols)
     table.add_rows([
-        ['ID', 'Title', 'Start', 'Stop'],
-        *((r[0], r[1], timestamp_to_local(r[2]), timestamp_to_local(r[3])) for r in c)
+        ['ID', 'Title', 'Start', 'Stop', 'Group'],
+        *((
+            r[0],
+            r[1],
+            timestamp_to_local(r[2]),
+            timestamp_to_local(r[3]),
+            get_title_group(r[1]),
+        ) for r in c)
     ])
     return table.draw()
 
-def timestamp_to_local(timestamp):
+
+def timestamp_to_local(timestamp, format='%B %-d, %Y | %H:%M %P'):
     if not timestamp:
         return ''
-    # time_format = '%Y-%m-%d %H:%M %P'
-    time_format = '%B %-d, %Y | %H:%M %P'
     return (
         pytz.utc.localize(datetime.fromtimestamp(timestamp))
             .astimezone(tzlocal())
-            .strftime(time_format)
+            .strftime(format)
     )
 
+
+def timestamp_to_local_date_string(timestamp):
+    return timestamp_to_local(timestamp, '%Y-%m-%d')
+
+
 def do_track():
-    init_db()
+    run_track_db_actions()
+    commit_and_close()
+
+
+def run_track_db_actions():
     title = get_title()
+    if is_inactive(title):
+        return
+    init_db()
     latest = fetch_latest_entry()
     if latest:
         # If the latest.title matches, check to see if it's within a time window
         # to infer that we're *still* working on it. If we are, we will bail out
         # with return and won't have to add a new entry.
         if latest.title == title:
-            if within_static_window(latest.stop) or within_static_window(latest.start):
+            if within_static_window(latest.stop) or within_static_window(
+                    latest.start):
                 update_entry_stop(latest, utcnow_timestamp())
                 return
         # If the title doesn't match, check to see if the latest.stop is None.
@@ -177,16 +515,21 @@ def do_track():
 
     add_entry(title, utcnow_timestamp())
 
+
 def update_entry_stop(entry, stop):
     print(f'Updating stop to {stop} for entry {entry}')
     DB.execute("update entries set stop = ? where id = ?", (stop, entry.id))
 
+
 def add_entry(title, start):
     print(f'Adding entry {repr(title)} at start {start}')
-    DB.execute("insert into entries (title, start) values (?, ?)", (title, start))
+    DB.execute("insert into entries (title, start) values (?, ?)",
+               (title, start))
+
 
 def utcnow_timestamp():
     return int(datetime.utcnow().timestamp())
+
 
 # If our activity didnt change within a 120 second window,
 # then assume we've been working on it since. This should work since
@@ -195,6 +538,19 @@ def within_static_window(timestamp):
     if not timestamp:
         return False
     return utcnow_timestamp() - timestamp < 120
+
+
+def do_completer():
+    # TODO: Hmm, this doesn't get commands, only flags...
+    from genzshcomp import CompletionGenerator
+    p = get_argument_parser()
+    print(CompletionGenerator('tau', p).get())
+
+
+# Application titles which signify inactivity and should not be tracked.
+INACTIVE_APPLICATIONS = {
+    'gnome-screensaver'
+}
 
 if __name__ == '__main__':
     main()
