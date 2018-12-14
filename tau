@@ -16,6 +16,20 @@ import sqlite3
 from subprocess import Popen, PIPE
 import sys
 import texttable
+import time
+import traceback
+
+IS_LINUX = sys.platform == 'linux'
+IS_MAC = sys.platform == 'darwin'
+
+if IS_MAC:
+    from AppKit import NSWorkspace
+    from Quartz import (
+        CGWindowListCopyWindowInfo,
+        kCGWindowListOptionOnScreenOnly,
+        kCGNullWindowID
+    )
+    import pync
 
 setproctitle('tau')
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -54,7 +68,8 @@ def get_argument_parser():
     command_p = p.add_subparsers(
         dest='command', parser_class=CommandArgumentParser)
 
-    command_p.add_parser('track', func=do_track)
+    track_p = command_p.add_parser('track', func=do_track)
+    track_p.add_argument('type', choices=track_types)
 
     view_p = command_p.add_parser('view', func=do_view)
     view_p.add_argument(
@@ -84,6 +99,9 @@ def get_argument_parser():
 
     timecard_p = command_p.add_parser('timecard', func=do_timecard)
     timecard_p.add_argument('date', nargs='?', type=timecard_date_str)
+    timecard_p.add_argument('--group-threshold', type=int, nargs='?',
+                            default=DEFAULT_TIMECARD_GROUP_THRESHOLD,
+                            help='Default minutes threshold for group summary')
 
     active_p = command_p.add_parser('active', func=do_active)
     active_p.add_argument(
@@ -135,7 +153,21 @@ def parse_args():
     return args
 
 
-def get_title():
+def switch_os(**kwargs):
+    linux = kwargs.pop('linux')
+    mac = kwargs.pop('mac')
+    if kwargs: raise TypeError('Unexpected kwargs: {}'.format(kwargs.keys()))
+    if IS_LINUX: return call_if_callable(linux)
+    if IS_MAC: return call_if_callable(mac)
+
+
+def call_if_callable(x): return x() if callable(x) else x
+
+
+def get_title(): return switch_os(linux=_get_title_linux, mac=_get_title_mac)
+
+
+def _get_title_linux():
     p = Popen(["xdotool", "getwindowfocus", "getwindowname"], stdout=PIPE,
               stderr=PIPE)
     p.wait()
@@ -155,7 +187,27 @@ def get_title():
     return out
 
 
+def _get_title_mac():
+    app = NSWorkspace.sharedWorkspace().frontmostApplication()
+    active_app_name = app.localizedName()
+
+    options = kCGWindowListOptionOnScreenOnly
+    windowList = CGWindowListCopyWindowInfo(options, kCGNullWindowID)
+    windowTitle = None
+    for window in windowList:
+        windowNumber = window['kCGWindowNumber']
+        ownerName = window['kCGWindowOwnerName']
+        windowTitle = window.get('kCGWindowName', u'Unknown')
+        if windowTitle and ownerName == active_app_name:
+            break
+    return active_app_name + ' :: ' + windowTitle
+
+
 def get_idle_time():
+    return switch_os(linux=_get_idle_time_linux, mac=_get_idle_time_mac)
+
+
+def _get_idle_time_linux():
     p = Popen(["xssstate", "-i"], stdout=PIPE)
     p.wait()
     out = p.stdout.read()
@@ -163,6 +215,19 @@ def get_idle_time():
         printerr(f'xssstate failed with nonzero exit code {p.returncode}')
         exit(1)
     return int(out.decode('utf8').strip()) / 1000
+
+
+def _get_idle_time_mac():
+    p = Popen([
+        'bash', '-c',
+        'echo $(($(ioreg -c IOHIDSystem | grep HIDIdleTime | cut -d= -f2) / 1000000000))'
+    ], stdout=PIPE)
+    p.wait()
+    out = p.stdout.read()
+    if p.returncode != 0:
+        printerr(f'ioreg failed with nonzero exit code {p.returncode}')
+        exit(1)
+    return int(out.decode('utf8').strip())
 
 
 IDLE_THRESHOLD = 300  # 5 minutes
@@ -329,9 +394,10 @@ def do_timecard(args):
                 punch = TimecardPunch(entry)
                 punches.append(punch)
                 last_punch_title_groups = {punch.title_group: punch.duration()}
-    print('/==========================\\')
-    print('|  Timecard: ' + args.date + '    |')
-    print('\\==========================/')
+    print('/================================\\')
+    print('|  Timecard: {}    |'.format(
+        dateutil.parser.parse(args.date).date().strftime('%a, %h %-d, %Y')))
+    print('\\================================/')
     print()
     print('Punches')
     print('------------------')
@@ -356,13 +422,13 @@ def do_timecard(args):
     print('--------------------------')
     by_title_sorted = sorted(
         ((k, timedelta(seconds=v)) for k, v in by_title.items()
-         if v >= TIMECARD_GROUP_THRESHOLD),
+         if v >= args.group_threshold),
         key=lambda t: -t[1])
     for k, v in by_title_sorted:
         print('{}: {}'.format(k, v))
 
 
-TIMECARD_GROUP_THRESHOLD = 600  # 10 minutes
+DEFAULT_TIMECARD_GROUP_THRESHOLD = 600  # 10 minutes
 
 
 class TimecardPunch:
@@ -438,7 +504,7 @@ def draw_table(args):
     if args.start and args.stop and not args.count:
         limit = ''
     else:
-        args.count = args.count or 100
+        args.count = args.count or 1000
         limit = f'limit {args.count}'
     if wheres:
         where = 'where ' + ' and '.join(f'({w})' for w in wheres)
@@ -454,7 +520,6 @@ def draw_table(args):
         """,
         q_args
     ]
-    print(*sql_args)
     c = DB.execute(*sql_args)
     # Using 0 as the default since that signals to texttable to use an unlimited width.
     (cols, _) = shutil.get_terminal_size((0, 0))
@@ -472,9 +537,14 @@ def draw_table(args):
     return table.draw()
 
 
-def timestamp_to_local(timestamp, format='%B %-d, %Y | %H:%M %P'):
+def timestamp_to_local(timestamp, format=None):
     if not timestamp:
         return ''
+    if not format:
+        if IS_MAC:
+            format = '%B %-d, %Y | %H:%M %p'
+        else:
+            format = '%B %-d, %Y | %H:%M %P'
     return (
         pytz.utc.localize(datetime.fromtimestamp(timestamp))
             .astimezone(tzlocal())
@@ -486,9 +556,40 @@ def timestamp_to_local_date_string(timestamp):
     return timestamp_to_local(timestamp, '%Y-%m-%d')
 
 
-def do_track():
-    run_track_db_actions()
-    commit_and_close()
+def do_track(args):
+    f = track_types.get(args.type)
+    if not f:
+        printerr(
+            f"Invalid track type {repr(args.type)}, must be one of: "
+            + ' '.join(map(repr, track_types)))
+        exit(1)
+    f()
+
+
+def do_track_oneshot():
+    try:
+        run_track_db_actions()
+        DB.commit()
+    except:
+        (_, e, tb) = sys.exc_info()
+        message = [f'track failed with exception {repr(e)}:']
+        message.extend(traceback.format_tb(tb))
+        message = '\n'.join(message)
+        printerr(message)
+        if IS_MAC:
+            pync.notify(message, title='tau')
+
+
+def do_track_daemon():
+    while True:
+        do_track_oneshot()
+        time.sleep(60)
+
+
+track_types = {
+    'oneshot': do_track_oneshot,
+    'daemon': do_track_daemon,
+}
 
 
 def run_track_db_actions():
