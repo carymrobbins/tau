@@ -8,6 +8,7 @@ from dateutil.tz import tzlocal
 import os
 from itertools import takewhile, dropwhile
 from inspect import signature
+import json
 import pytz
 import re
 import shutil
@@ -65,6 +66,11 @@ def printerr(*args, **kwargs):
 def get_argument_parser():
     p = argparse.ArgumentParser(description='Tau time tracker')
 
+    p.add_argument(
+        '--tz', nargs='?', type=pytz.timezone, default=tzlocal(),
+        help='Timezone to be used; defaults to system timezone'
+    )
+
     command_p = p.add_subparsers(
         dest='command', parser_class=CommandArgumentParser)
 
@@ -89,12 +95,20 @@ def get_argument_parser():
         help='Select a stop time for filtering entries'
     )
     view_p.add_argument(
+        '--day', nargs='?', type=dateutil.parser.parse,
+        help='Select a date for filtering entries (equivalent to --start and --stop for date)'
+    )
+    view_p.add_argument(
         '--pager', default='less',
         help="Pager for view command; defaults to 'less'"
     )
     view_p.add_argument(
         '--nopager', action='store_const', const=True, default=False,
         help='Disable pager for view command'
+    )
+    view_p.add_argument(
+        '--format', choices=['table', 'json'], default='table',
+        help='Output format for viewing entries (default is table)'
     )
 
     timecard_p = command_p.add_parser('timecard', func=do_timecard)
@@ -203,6 +217,43 @@ def _get_title_mac():
     return active_app_name + ' :: ' + windowTitle
 
 
+def get_entry_state():
+    """Useful for dumping extra info to the db for additional time analysis
+    :rtype: dict|None
+    """
+    last_work_dir = None
+    last_work_dir_cache = os.path.expanduser('~/.oh-my-zsh/cache/last-working-dir')
+    try:
+        stale_seconds = time.time() - os.stat(last_work_dir_cache).st_mtime
+        with open(last_work_dir_cache) as h:
+            last_work_dir = h.read().strip()
+        # Every time a zsh is started or a 'cd' command is issued, the
+        # last_work_dir_cache is touched and its stale_seconds should be reset.
+        # If we've gone 24 hours without touching this file, let's consider it
+        # too stale for use. This might mean that we're using a different shell
+        # or something else is going on to where this info can't be used.
+        if stale_seconds / 60 / 60 > 24:
+            last_work_dir = None
+    except FileNotFoundError:
+        pass
+    if last_work_dir is None:
+        return None
+    p = Popen(
+        ['git', 'rev-parse', 'HEAD', '--abbrev-ref', 'HEAD'],
+        cwd=last_work_dir,
+        stdout=PIPE
+    )
+    if p.wait() != 0:
+        printerr(f'Failed to get last work dir branch, exit code {p.returncode}')
+        return None
+    rev, branch = p.stdout.read().decode('utf8').splitlines()
+    return {
+        'workDir': last_work_dir,
+        'gitRev': rev,
+        'gitBranch': branch,
+    }
+
+
 def get_idle_time():
     return switch_os(linux=_get_idle_time_linux, mac=_get_idle_time_mac)
 
@@ -238,8 +289,13 @@ def is_inactive(title):
     return title in INACTIVE_APPLICATIONS or get_idle_time() > IDLE_THRESHOLD
 
 
+def DB_execute_log_sql(sql, args=()):
+    printerr('DB.execute({!r}, {!r})'.format(sql, args))
+    return DB.execute(sql, args)
+
+
 def init_db():
-    DB.execute("""
+    DB_execute_log_sql("""
         create table if not exists
         entries(
             id integer primary key autoincrement,
@@ -249,21 +305,42 @@ def init_db():
         )
     """)
 
+    def column_exists(col_name):
+        [n] = DB_execute_log_sql("""
+            select count(*)
+            from pragma_table_info('entries')
+            where name = ?
+        """, (col_name,)).fetchone()
+        return n != 0
+
+    def add_column_if_not_exists(col_name, col_type):
+        if not column_exists(col_name):
+            DB_execute_log_sql("""
+                alter table entries add column {} {}
+            """.format(col_name, col_type))
+
+    add_column_if_not_exists('state', 'json')
+
 
 class Entry:
     @classmethod
     def from_row(cls, r):
         if r is None:
             return None
-        if len(r) != 4:
-            raise RuntimeError(f'Expected 4 columns but got {len(r)}')
-        return Entry(*r)
+        try:
+            id, title, start, stop, state = r
+        except ValueError as e:
+            raise RuntimeError(f'Expected 5 columns but got {len(r)}', e)
+        if state is not None:
+            state = json.loads(state)
+        return Entry(id, title, start, stop, state)
 
-    def __init__(self, id, title, start, stop):
+    def __init__(self, id, title, start, stop, state):
         self.id = id
         self.title = title
         self.start = start
         self.stop = stop
+        self.state = state
 
     def __repr__(self):
         return (
@@ -271,8 +348,9 @@ class Entry:
                 ', '.join((
                     repr(self.id),
                     repr(self.title),
-                    repr(timestamp_to_local(self.start)),
-                    repr(timestamp_to_local(self.stop))
+                    repr(self.start),
+                    repr(self.stop),
+                    repr(self.state)
                 )) +
                 ')'
         )
@@ -281,7 +359,7 @@ class Entry:
 def fetch_latest_entry():
     return Entry.from_row(
         DB.execute("""
-            select id, title, start, stop
+            select id, title, start, stop, state
             from entries
             order by id desc
             limit 1
@@ -303,7 +381,7 @@ def do_active(args):
     ref = now
     last = Entry.from_row(
         DB.execute("""
-            select id, title, start, stop
+            select id, title, start, stop, state
             from entries
             order by id desc
             limit 1
@@ -314,7 +392,7 @@ def do_active(args):
         ref = last.start
         last = Entry.from_row(
             DB.execute("""
-                select id, title, start, stop
+                select id, title, start, stop, state
                 from entries
                 where id < ?
                 order by id desc
@@ -329,13 +407,25 @@ def do_active(args):
 
 
 def do_view(args):
-    if args.count and args.count <= 0:
+    if args.count and args.count < 0:
         printerr(f'Invalid --count {args.count}; must be > 0')
         exit(1)
-    table = draw_table(args)
-    if args.nopager:
-        print(table)
-    else:
+    if args.day:
+        if (args.start, args.stop) != (None, None):
+            printerr('Cannot supply --day with --start or --stop')
+            exit(1)
+        # Invert --reverse by default.
+        args.reverse = not args.reverse
+        args.start = args.day
+        args.stop = args.day + timedelta(days=1)
+    if args.format == 'json':
+        print(draw_json(args))
+        return
+    if args.format == 'table':
+        table = draw_table(args)
+        if args.nopager:
+            print(table)
+            return
         try:
             p = Popen(args.pager, stdin=PIPE)
             p.stdin.write(table.encode('utf8'))
@@ -343,19 +433,22 @@ def do_view(args):
             p.wait()
         except KeyboardInterrupt:
             pass
+        return
+    printerr('Invalid format type {!r}'.format(args.format))
+    exit(1)
 
 
 def do_timecard(args):
     if args.date is None:
         args.date = str(date.today())
     c = DB.cursor()
-    c.execute("select id, title, start, stop from entries order by id desc")
+    c.execute("select id, title, start, stop, state from entries order by id desc")
     it = map(Entry.from_row, c)
     list(takewhile(
-        lambda x: x and timestamp_to_local_date_string(x.start) > args.date,
+        lambda x: x and timestamp_to_local_date_string(x.start, args.tz) > args.date,
         it))
     entries = list(takewhile(
-        lambda x: x and timestamp_to_local_date_string(x.start) == args.date,
+        lambda x: x and timestamp_to_local_date_string(x.start, args.tz) == args.date,
         it))
     c.close()
     by_title = {}
@@ -410,8 +503,8 @@ def do_timecard(args):
             acc += dur
             print('{} | {} - {} | {} | [{}|{}%] {} '.format(
                 acc,
-                timestamp_to_local(punch.start, '%I:%M %p').lower(),
-                timestamp_to_local(punch.stop, '%I:%M %p').lower(),
+                timestamp_to_local(punch.start, args.tz, '%I:%M %p').lower(),
+                timestamp_to_local(punch.stop, args.tz, '%I:%M %p').lower(),
                 dur,
                 timedelta(seconds=punch.group_dur),
                 round(float(punch.group_dur) / dur.seconds * 100),
@@ -488,7 +581,7 @@ def get_title_group(title):
     return title
 
 
-def draw_table(args):
+def run_view_query(args):
     wheres = []
     q_args = []
     if args.start:
@@ -503,16 +596,17 @@ def draw_table(args):
         order = 'order by id desc'
     if args.start and args.stop and not args.count:
         limit = ''
+    elif args.count == 0:
+        limit = ''
     else:
-        args.count = args.count or 1000
-        limit = f'limit {args.count}'
+        limit = f'limit {args.count or 1000}'
     if wheres:
         where = 'where ' + ' and '.join(f'({w})' for w in wheres)
     else:
         where = ''
     sql_args = [
         f"""
-            select id, title, start, stop
+            select id, title, start, stop, state
             from entries
             {where}
             {order}
@@ -520,40 +614,78 @@ def draw_table(args):
         """,
         q_args
     ]
-    c = DB.execute(*sql_args)
+    return DB.execute(*sql_args)
+
+
+def draw_table(args):
     # Using 0 as the default since that signals to texttable to use an unlimited width.
     (cols, _) = shutil.get_terminal_size((0, 0))
     table = texttable.Texttable(max_width=cols)
     table.add_rows([
-        ['ID', 'Title', 'Start', 'Stop', 'Group'],
+        ['ID', 'Title', 'Start', 'Stop', 'Group', 'State'],
         *((
             r[0],
             r[1],
-            timestamp_to_local(r[2]),
-            timestamp_to_local(r[3]),
+            timestamp_to_local(r[2], args.tz),
+            timestamp_to_local(r[3], args.tz),
             get_title_group(r[1]),
-        ) for r in c)
+            r[4],
+        ) for r in run_view_query(args))
     ])
     return table.draw()
 
 
-def timestamp_to_local(timestamp, format=None):
+def draw_json(args):
+    return json.dumps(mk_json(args))
+
+
+def mk_json(args):
+
+    def to_utc(ts):
+        return datetime.fromtimestamp(ts) \
+            .replace(tzinfo=pytz.UTC).isoformat()[:-6] + 'Z'
+
+    def to_local(ts):
+        return datetime.fromtimestamp(ts) \
+            .replace(tzinfo=pytz.UTC).astimezone(args.tz).isoformat()
+
+    return [
+        {
+            'id': r[0],
+            'title': r[1],
+            'group': get_title_group(r[1]),
+            'start': {
+                'timestamp': r[2],
+                'utc': to_utc(r[2]),
+                'localized': to_local(r[2]),
+            },
+            'stop': {
+                'timestamp': r[3],
+                'utc': to_utc(r[3]),
+                'localized': to_local(r[3]),
+            }
+        }
+        for r in run_view_query(args)
+    ]
+
+
+def timestamp_to_local(timestamp, tz, format=None):
     if not timestamp:
         return ''
     if not format:
         if IS_MAC:
-            format = '%B %-d, %Y | %H:%M %p'
+            format = '%B %-d, %Y | %I:%M %p'
         else:
-            format = '%B %-d, %Y | %H:%M %P'
+            format = '%B %-d, %Y | %I:%M %P'
     return (
         pytz.utc.localize(datetime.fromtimestamp(timestamp))
-            .astimezone(tzlocal())
+            .astimezone(tz)
             .strftime(format)
     )
 
 
-def timestamp_to_local_date_string(timestamp):
-    return timestamp_to_local(timestamp, '%Y-%m-%d')
+def timestamp_to_local_date_string(timestamp, tz):
+    return timestamp_to_local(timestamp, tz, '%Y-%m-%d')
 
 
 def do_track(args):
@@ -623,9 +755,10 @@ def update_entry_stop(entry, stop):
 
 
 def add_entry(title, start):
-    print(f'Adding entry {repr(title)} at start {start}')
-    DB.execute("insert into entries (title, start) values (?, ?)",
-               (title, start))
+    state = json.dumps(get_entry_state())
+    print(f'Adding entry {repr(title)} at start {start} with state {state}')
+    DB.execute("insert into entries (title, start, state) values (?, ?, json(?))",
+               (title, start, state))
 
 
 def utcnow_timestamp():
