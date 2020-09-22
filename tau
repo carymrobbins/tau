@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env pipenv-shebang
 
 import argparse
 from collections import namedtuple
@@ -483,6 +483,8 @@ def do_timecard(args):
                 last_punch.title_group, last_punch.group_dur = max(
                     last_punch_title_groups.items(),
                     key=lambda kv: kv[1])
+                # Update punch branches
+                last_punch.add_branch_from_entry(entry)
             else:
                 punch = TimecardPunch(entry)
                 punches.append(punch)
@@ -494,14 +496,14 @@ def do_timecard(args):
     print()
     print('Punches')
     print('------------------')
-    print('Acc     | In       - Out      | Dur     | Group Mode')
+    print('Acc     | In       - Out      | Dur     | Group Mode / Branches')
     acc = timedelta()
     for punch in punches:
         seconds = punch.duration()
         if seconds > IDLE_THRESHOLD:
             dur = timedelta(seconds=seconds)
             acc += dur
-            print('{} | {} - {} | {} | [{}|{}%] {} '.format(
+            print('{} | {} - {} | {} | [{}|{}%] {}'.format(
                 acc,
                 timestamp_to_local(punch.start, args.tz, '%I:%M %p').lower(),
                 timestamp_to_local(punch.stop, args.tz, '%I:%M %p').lower(),
@@ -510,6 +512,26 @@ def do_timecard(args):
                 round(float(punch.group_dur) / dur.seconds * 100),
                 punch.title_group,
             ))
+            for branch in punch.branches:
+                print((' ' * 42) + branch)
+    print()
+    print('Branches')
+    print('------------------')
+    gitInfos = {}
+    for entry in entries:
+        if not entry.state:
+            continue
+        k = entry.state.get('workDir')
+        v = entry.state.get('gitBranch')
+        if not k or not v:
+            continue
+        vs = gitInfos.get(k, set())
+        vs.add(v)
+        gitInfos[k] = vs
+    for k in sorted(gitInfos.keys()):
+        print(f'* {k}')
+        for v in sorted(gitInfos[k]):
+            print(f'    - {v}')
     print()
     print('Timecard by title group')
     print('--------------------------')
@@ -524,12 +546,39 @@ def do_timecard(args):
 DEFAULT_TIMECARD_GROUP_THRESHOLD = 600  # 10 minutes
 
 
+def unexpanduser(p):
+    userhome = os.path.expanduser('~')
+    if p.startswith(userhome):
+        return p.replace(userhome, '~', 1)
+    return p
+
+
 class TimecardPunch:
     def __init__(self, entry):
         self.start = entry.start
         self.stop = entry.stop
         self.title_group = get_title_group(entry.title)
         self.group_dur = self.duration()
+        self.branches = set()
+        self.add_branch_from_entry(entry)
+
+    def add_branch_from_entry(self, entry):
+        if not entry.state:
+            return
+        work_dir, git_branch = map(entry.state.get, ('workDir', 'gitBranch'))
+        if work_dir and git_branch:
+            #TODO: Trying to make this a dict with duration info
+            #work_dir = unexpanduser(work_dir)
+            #bs = self.branches.get(work_dir)
+            #if bs is None:
+            #    bs = {}
+            #    self.branches[work_dir] = bs
+            #t = bs.get(git_branch, 0)
+            #t += entry.stop - entry.start
+            #if work_dir in self.branches:
+            #    bs = self.branches[work_dir]
+            #if self.branches
+            self.branches.add(f'{unexpanduser(work_dir)} : {git_branch}')
 
     def duration(self):
         return self.stop - self.start
@@ -629,7 +678,8 @@ def draw_table(args):
             timestamp_to_local(r[2], args.tz),
             timestamp_to_local(r[3], args.tz),
             get_title_group(r[1]),
-            r[4],
+            # pretty-print json
+            r[4] and json.dumps(json.loads(r[4]), indent=2),
         ) for r in run_view_query(args))
     ])
     return table.draw()
@@ -642,10 +692,14 @@ def draw_json(args):
 def mk_json(args):
 
     def to_utc(ts):
+        if ts is None:
+            return None
         return datetime.fromtimestamp(ts) \
             .replace(tzinfo=pytz.UTC).isoformat()[:-6] + 'Z'
 
     def to_local(ts):
+        if ts is None:
+            return None
         return datetime.fromtimestamp(ts) \
             .replace(tzinfo=pytz.UTC).astimezone(args.tz).isoformat()
 
